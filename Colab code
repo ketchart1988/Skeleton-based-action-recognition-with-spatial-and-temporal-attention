@@ -1,0 +1,228 @@
+// Function
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os
+import glob
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.layers import Input, Bidirectional, GRU, Dense, Reshape, Flatten, GlobalAveragePooling1D, MultiHeadAttention, LayerNormalization
+from tensorflow.keras.models import Model
+import itertools
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
+from sklearn.model_selection import train_test_split
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Define the path to the NTU RGB+D dataset
+dataset_path = '/content/drive/MyDrive/ntu-rgbd'
+
+# Function to calculate velocity
+def calculate_velocity(skeletons):
+    velocity = np.diff(skeletons, axis=0)
+    speed = np.linalg.norm(velocity, axis=-1)
+    return speed
+
+# Function to build attention model
+def build_attention_model(input_shape, num_heads, key_dim):
+    input_layer = Input(shape=input_shape)
+    attention_output = MultiHeadAttention(num_heads=num_heads, key_dim=key_dim)(input_layer, input_layer)
+    attention_output = LayerNormalization(epsilon=1e-6)(attention_output)
+    attention_scores = MultiHeadAttention(num_heads=num_heads, key_dim=key_dim)(input_layer, input_layer, return_attention_scores=True)[1]
+    return Model(inputs=input_layer, outputs=[attention_output, attention_scores])
+
+# Function to find the center frame using attention weights
+def find_center_frame(attention_weights):
+    return np.argmax(attention_weights)
+
+def adaptive_segmentation_using_attention(skeletons, center_frame, function_attention_weights, threshold, min_len):
+    half_length = 0
+    max_length = min(center_frame, len(skeletons) - center_frame)
+    # print(center_frame)
+
+    for i in range(1, max_length):
+        # Ensure that the indices are within the valid range
+        left_index = center_frame - i
+        right_index = center_frame + i
+        if left_index >= 0 and right_index < len(function_attention_weights):
+            if function_attention_weights[left_index][1] < threshold * function_attention_weights[center_frame][1] and \
+               function_attention_weights[right_index][1] < threshold *  function_attention_weights[center_frame][1]:
+                break
+        half_length += 1
+
+    start = max(0, center_frame - half_length)
+    end = min(len(skeletons), center_frame + half_length + 1)
+
+    if len(skeletons[start:end]) < 100 : # 0.1 * num_frames
+      # Initialize Left_length, Right_length, and Length before using them
+      Left_length = 0
+      Right_length = 0
+      Length = 0
+      for i in range(1, 100): # 0.1 * num_frames
+        # Ensure that the indices are within the valid range
+        left_index = center_frame - i
+        right_index = center_frame + i
+        if left_index >= 0:
+          Left_length += 1
+          Length += 1
+        if Length == min_len * num_frames -1: # 50 * 300 is really high, the number will not go there. The code worked correctly
+          break
+        if right_index < num_frames:
+          Right_length += 1
+          Length += 1
+        if Length == min_len * num_frames -1: # Honestly, the correct code would be ---> if Length == min_len :
+          break
+
+      start = center_frame - Left_length
+      end = center_frame + Right_length
+
+    return skeletons[start:end]
+
+# Preprocess the data to find significant segments using attention
+def preprocess_data_for_classification(skeletons, labels, num_classes, threshold, min_len, fixed_length):
+    significant_segments = []
+
+    for skeleton in skeletons:
+        # Calculate the velocity and prepare the input for the attention model
+        velocity = calculate_velocity(skeleton)
+        velocity_input = np.reshape(velocity, (1, velocity.shape[0], velocity.shape[1]))  # Shape (1, num_frames-1, num_joints)
+
+        # Build and compile the attention model
+        attention_model = build_attention_model(input_shape=(velocity_input.shape[1], velocity_input.shape[2]), num_heads=8, key_dim=16)
+        attention_output, attention_scores = attention_model(velocity_input)
+
+        # Calculate attention weights
+        attention_weights = np.mean(attention_scores, axis=1).flatten()
+
+        # Map attention scores back to original frame indices
+        frame_indices = np.arange(velocity.shape[0])
+        frame_attention_pairs = sorted(zip(frame_indices, attention_weights), key=lambda x: x[1], reverse=True)
+
+        # Find the center frame using attention weights
+        center_frame = find_center_frame([pair[1] for pair in frame_attention_pairs])
+
+        # Perform adaptive segmentation using attention weights
+        attention_weights_pair = sorted(frame_attention_pairs, key=lambda x: x[0], reverse=False)
+        c_frame = frame_attention_pairs[center_frame][0]
+        significant_segment = adaptive_segmentation_using_attention(skeleton, c_frame, attention_weights_pair, threshold, min_len)
+
+        # Pad or truncate significant segments to a fixed length
+        # fixed_length = 300 # 100 #int(num_frames)   # Choose an appropriate fixed length
+        if significant_segment.shape[0] < fixed_length: # This if-condition will not happen, the previous function already make its length = 100
+            padding = np.zeros((fixed_length - significant_segment.shape[0], 25, 3))
+            significant_segment = np.vstack((significant_segment, padding))
+        else:
+            significant_segment = significant_segment[:fixed_length]
+
+        significant_segments.append(significant_segment)
+
+    significant_segments = np.array(significant_segments)
+    y_classification = tf.keras.utils.to_categorical(labels, num_classes=num_classes)  # No need to subtract 1 if labels are already 0-based
+    return significant_segments, y_classification
+
+# # Encoder
+# def build_encoder(input_shape):
+#     input_layer = Input(shape=input_shape)
+#     reshape_layer = Reshape((f, j * p))(input_layer)
+#     encoder = Bidirectional(GRU(30, return_sequences=True))(reshape_layer)
+#     pooled_output = GlobalAveragePooling1D()(encoder)
+#     return input_layer, pooled_output
+
+# Encoder
+def build_encoder(input_shape):
+    input_layer = Input(shape=input_shape)
+    reshape_layer = Reshape((input_shape[0], input_shape[1] * input_shape[2]))(input_layer)
+    encoder = Bidirectional(GRU(30, return_sequences=True))(reshape_layer)
+    pooled_output = GlobalAveragePooling1D()(encoder)
+    return input_layer, pooled_output
+
+# Decoder for Jigsaw Puzzle
+def build_decoder(encoder_output):
+    num_features = encoder_output.shape[1]
+    segment_length = num_features // s
+    if num_features % s != 0:
+        raise ValueError("The number of features must be divisible by the number of segments (s).")
+
+    # Use the Reshape layer from Keras to reshape the KerasTensor
+    segments = Reshape((s, segment_length))(encoder_output)
+    segments_flat = Flatten()(segments)
+    mlp = Dense(128, activation='relu')(segments_flat)
+    mlp = Dense(64, activation='relu')(mlp)
+    output_layer = Dense(np.math.factorial(s), activation='softmax')(mlp)
+    return output_layer
+
+
+# Classifier for action recognition
+def build_classifier(encoder_output):
+    mlp = Dense(128, activation='relu')(encoder_output)
+    mlp = Dense(64, activation='relu')(mlp)
+    output_layer = Dense(num_classes, activation='softmax')(mlp)
+    return output_layer
+
+# Function to preprocess the data for the jigsaw puzzle task
+def preprocess_data_for_jigsaw(X, s):
+    X_shuffled = np.copy(X)
+    y_jigsaw = []
+    for i in range(X.shape[0]):
+        segments = np.array_split(X_shuffled[i], s)
+        permutation = np.random.permutation(s)
+        shuffled_segments = [segments[i] for i in permutation]
+        X_shuffled[i] = np.concatenate(shuffled_segments)
+        y_jigsaw.append(permutation)
+    y_jigsaw = np.array([list(itertools.permutations(range(s))).index(tuple(label)) for label in y_jigsaw])
+    y_jigsaw = tf.keras.utils.to_categorical(y_jigsaw, num_classes=np.math.factorial(s))
+    return X_shuffled, y_jigsaw
+
+class StopAtAccuracy(tf.keras.callbacks.Callback):
+    def __init__(self, target_accuracy):
+        super(StopAtAccuracy, self).__init__()
+        self.target_accuracy = target_accuracy
+
+    def on_epoch_end(self, epoch, logs=None):
+        val_accuracy = logs.get('accuracy')
+        if val_accuracy is not None and val_accuracy >= self.target_accuracy / 100:
+            print(f"\nReached {self.target_accuracy}% validation accuracy, stopping training at epoch {epoch+1}.")
+            self.model.stop_training = True
+
+//Training
+
+# Parameters
+f = 300  # Number of frames
+num_frames = 300  # Number of frames
+j = 25   # Number of joints
+p = 3    # Position of each joint (x, y, z)
+s = 3
+num_classes = 60  # Number of classes for classification
+
+threshold=  0.8
+min_len = 50
+fixed_length= 100
+
+#Input Preprocess data
+X_train_classification = np.load('/content/drive/My Drive/skeletons[]/X_train_classification_combined.npy')
+y_train_classification = np.load('/content/drive/My Drive/skeletons[]/y_train_classification_combined.npy')
+X_test_classification = np.load('/content/drive/My Drive/skeletons[]/X_test_classification_combined.npy')
+y_test_classification = np.load('/content/drive/My Drive/skeletons[]/y_test_classification_combined.npy')
+
+# Build and compile the classification model
+input_layer, encoder_output = build_encoder((X_train_classification.shape[1], j, p))  # Update input shape to segment length
+
+classifier_output = build_classifier(encoder_output)
+classification_model = Model(inputs=input_layer, outputs=classifier_output)
+classification_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+# Display the classification model summary
+classification_model.summary()
+
+# Train the classification model
+classification_model.fit(X_train_classification, y_train_classification, epochs=500, batch_size=32, callbacks=[early_stopping])
+
+# Evaluate the model on the test set
+classification_model.evaluate(X_test_classification, y_test_classification)
