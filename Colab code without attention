@@ -1,0 +1,200 @@
+// function
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os
+import glob
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.layers import Input, Bidirectional, GRU, Dense, Reshape, Flatten, GlobalAveragePooling1D, MultiHeadAttention, LayerNormalization
+from tensorflow.keras.models import Model
+import itertools
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
+from sklearn.model_selection import train_test_split
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Define the path to the NTU RGB+D dataset
+dataset_path = '/content/drive/MyDrive/ntu-rgbd'
+
+def load_skeleton_data(dataset_path, max_frames=300):
+    all_skeletons = []
+    all_labels = []
+
+    for file in glob.glob(os.path.join(dataset_path, '*.skeleton')):
+        with open(file, 'r') as f:
+            data = f.readlines()
+
+        num_frames = int(data[0].strip())
+        skeletons = []
+        index = 1
+        for _ in range(num_frames):
+            num_bodies = int(data[index].strip())
+            index += 1
+            for _ in range(num_bodies):
+                index += 2
+                joints = []
+                for _ in range(25):  # NTU dataset has 25 joints
+                    joint_data = list(map(float, data[index].strip().split()))
+                    joints.append(joint_data[:3])  # Use only (x, y, z) coordinates
+                    index += 1
+                skeletons.append(joints)
+
+        # Ensure skeletons is always 3D, even with one frame
+        # Reshape to (num_frames, 25, 3) before adding new axis
+        skeletons = np.array(skeletons).reshape(-1, 25, 3)
+        skeletons = skeletons[np.newaxis, :, :, :]  # shape: (1, num_frames, 25, 3)
+
+        if skeletons.shape[1] < max_frames:
+            padding = np.zeros((1, max_frames - skeletons.shape[1], 25, 3))
+            skeletons = np.concatenate((skeletons, padding), axis=1)
+        else:
+            skeletons = skeletons[:, :max_frames, :, :]
+
+        action_id = int(file.split('A')[1][:3])
+        all_skeletons.append(skeletons[0]) # Extract the 3D skeleton data
+        all_labels.append(action_id)
+
+    return np.array(all_skeletons), np.array(all_labels)
+
+# Encoder
+def build_encoder(input_shape):
+    input_layer = Input(shape=input_shape)
+    reshape_layer = Reshape((f, j * p))(input_layer)
+    encoder = Bidirectional(GRU(30, return_sequences=True))(reshape_layer)
+    pooled_output = GlobalAveragePooling1D()(encoder)
+    return input_layer, pooled_output
+
+# Decoder for Jigsaw Puzzle
+def build_decoder(encoder_output):
+    num_features = encoder_output.shape[1]
+    segment_length = num_features // s
+    if num_features % s != 0:
+        raise ValueError("The number of features must be divisible by the number of segments (s).")
+
+    # Use the Reshape layer from Keras to reshape the KerasTensor
+    segments = Reshape((s, segment_length))(encoder_output)
+    segments_flat = Flatten()(segments)
+    mlp = Dense(128, activation='relu')(segments_flat)
+    mlp = Dense(64, activation='relu')(mlp)
+    output_layer = Dense(np.math.factorial(s), activation='softmax')(mlp)
+    return output_layer
+
+
+# Classifier for action recognition
+def build_classifier(encoder_output):
+    mlp = Dense(128, activation='relu')(encoder_output)
+    mlp = Dense(64, activation='relu')(mlp)
+    output_layer = Dense(num_classes, activation='softmax')(mlp)
+    return output_layer
+
+# Function to preprocess the data for the jigsaw puzzle task
+def preprocess_data_for_jigsaw(X, s):
+    X_shuffled = np.copy(X)
+    y_jigsaw = []
+    for i in range(X.shape[0]):
+        segments = np.array_split(X_shuffled[i], s)
+        permutation = np.random.permutation(s)
+        shuffled_segments = [segments[i] for i in permutation]
+        X_shuffled[i] = np.concatenate(shuffled_segments)
+        y_jigsaw.append(permutation)
+    y_jigsaw = np.array([list(itertools.permutations(range(s))).index(tuple(label)) for label in y_jigsaw])
+    y_jigsaw = tf.keras.utils.to_categorical(y_jigsaw, num_classes=np.math.factorial(s))
+    return X_shuffled, y_jigsaw
+
+class StopAtAccuracy(tf.keras.callbacks.Callback):
+    def __init__(self, target_accuracy):
+        super(StopAtAccuracy, self).__init__()
+        self.target_accuracy = target_accuracy
+
+    def on_epoch_end(self, epoch, logs=None):
+        val_accuracy = logs.get('accuracy')
+        if val_accuracy is not None and val_accuracy >= self.target_accuracy / 100:
+            print(f"\nReached {self.target_accuracy}% validation accuracy, stopping training at epoch {epoch+1}.")
+            self.model.stop_training = True
+
+skeletons, labels = load_skeleton_data(dataset_path)
+print(f'Skeleton data shape: {skeletons.shape}')
+print(f'Labels shape: {labels.shape}')
+
+// training
+# Load the data (assuming you have already loaded it)
+# Using NTU RGB+D dataset as previously discussed
+# X_train, X_test, y_train, y_test = (your code to load and split the data)
+
+# Parameters
+f = 300  # Number of frames
+j = 25   # Number of joints
+p = 3    # Position of each joint (x, y, z)
+s = 3    # Number of segments to divide the sequence into
+num_classes = 60  # Number of classes for classification
+
+# Split data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(skeletons, labels, test_size=0.2, random_state=42)
+
+# Build and compile the jigsaw puzzle model
+input_layer, encoder_output = build_encoder((f, j, p))
+decoder_output = build_decoder(encoder_output)
+jigsaw_model = Model(inputs=input_layer, outputs=decoder_output)
+jigsaw_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+# Display the model summary
+jigsaw_model.summary()
+
+# Preprocess the data for jigsaw puzzle
+X_train_jigsaw, y_jigsaw = preprocess_data_for_jigsaw(X_train, s)
+
+# Pre-train the jigsaw model
+jigsaw_model.fit(X_train_jigsaw, y_jigsaw, epochs=500, batch_size=32, callbacks=[early_stopping])
+
+# Save the encoder weights after pre-training
+encoder_weights = jigsaw_model.get_layer(index=1).get_weights()
+
+# Build the classification model with the pre-trained encoder weights
+input_layer, encoder_output = build_encoder((f, j, p))
+classifier_output = build_classifier(encoder_output)
+classification_model_with_pretrain = Model(inputs=input_layer, outputs=classifier_output)
+classification_model_with_pretrain.get_layer(index=1).set_weights(encoder_weights)
+classification_model_with_pretrain.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+# Display the classification model summary
+classification_model_with_pretrain.summary()
+
+# Function to preprocess data for classification
+def preprocess_data_for_classification(skeletons, labels, num_classes):
+    y_classification = tf.keras.utils.to_categorical(labels - 1, num_classes=num_classes)  # Adjust labels to start from 0
+    return skeletons, y_classification
+
+# Preprocess the training and testing data for classification
+X_train_classification, y_train_classification = preprocess_data_for_classification(X_train, y_train, num_classes)
+X_test_classification, y_test_classification = preprocess_data_for_classification(X_test, y_test, num_classes)
+
+# Train the classification model with pre-training
+classification_model_with_pretrain.fit(X_train_classification, y_train_classification, epochs=500, batch_size=32, callbacks=[early_stopping])
+
+# Evaluate the model on the test set
+classification_model_with_pretrain.evaluate(X_test_classification, y_test_classification)
+
+print("without pre-training")
+
+# Build the classification model without pre-training
+input_layer, encoder_output = build_encoder((f, j, p))
+classifier_output = build_classifier(encoder_output)
+classification_model_without_pretrain = Model(inputs=input_layer, outputs=classifier_output)
+classification_model_without_pretrain.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+# Display the classification model summary
+classification_model_without_pretrain.summary()
+
+# Train the classification model without pre-training
+classification_model_without_pretrain.fit(X_train_classification, y_train_classification, epochs=500, batch_size=32, callbacks=[early_stopping])
+
+# Evaluate the model on the test set
+classification_model_without_pretrain.evaluate(X_test_classification, y_test_classification)
