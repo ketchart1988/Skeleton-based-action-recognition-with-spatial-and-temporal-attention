@@ -1,4 +1,5 @@
-Skeleton-based action recognition with spatial and temporal attention
+Skeleton-based action recognition with spatial and temporal attention.
+Using an attention mechanism, the model can detect significant parts of the data, reducing the amount of data required for training. Moreover, the model is able to maintain the accuracy of action recognition.
 In the image.jpg, the file list:
 Untitled228 = joint velocity plot
 Untitled245 = Colab code without attention
